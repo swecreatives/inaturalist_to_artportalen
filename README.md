@@ -238,7 +238,8 @@ Fältavgränsare indata: Komma (,)
 Fältavgränsare utdata: Tab (\t)
 📜 Versionshistorik
 Version	Datum	Ändringar
-1.0	2024	Första version
+1.0	2026-08-16	Första version
+1.1 2026-09-16  Nu stödjer skriptet fler än en bild samt medskapare
 🤝 Bidra
 Om du hittar buggar eller har förbättringsförslag:
 
