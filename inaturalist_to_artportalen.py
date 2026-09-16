@@ -2,6 +2,8 @@
 
 import csv
 import re
+import time
+import requests
 from pyproj import Transformer
 
 
@@ -10,13 +12,20 @@ from pyproj import Transformer
 # ============================================================
 
 INPUT_FILE = "inaturalist_observations.csv"
-OUTPUT_FILE = "artportalen.tsv"
+OUTPUT_FILE = "artportalen_import.tsv"
 ERROR_FILE = "artportalen_fel.log"
+
+# Paus mellan API-anrop till iNaturalist
+API_DELAY = 0.25
+
+# iNaturalist API
+INAT_API_URL = "https://api.inaturalist.org/v1/observations/{}"
 
 
 # ============================================================
 # KOORDINATSYSTEM
-#
+# ============================================================
+
 # iNaturalist:
 # WGS84 / EPSG:4326
 #
@@ -96,6 +105,7 @@ ARTPORTAL_FIELDS = [
     "Aktivitet",
     "Metod",
     "Lokalnamn",
+    "Huvudlokal",
     "Ost",
     "Nord",
     "Noggrannhet",
@@ -148,6 +158,12 @@ ARTPORTAL_FIELDS = [
     "Ej funnen",
 ]
 
+if len(ARTPORTAL_FIELDS) != 60:
+    raise RuntimeError(
+        "Programmeringsfel: ARTPORTAL_FIELDS måste innehålla exakt 60 kolumner, "
+        f"men innehåller {len(ARTPORTAL_FIELDS)}."
+    )
+
 
 # ============================================================
 # HJÄLPFUNKTIONER
@@ -156,7 +172,6 @@ ARTPORTAL_FIELDS = [
 def clean(value):
     if value is None:
         return ""
-
     return str(value).strip()
 
 
@@ -244,6 +259,133 @@ def convert_coordinates(latitude, longitude):
 
     except Exception:
         return "", ""
+
+
+# ============================================================
+# HÄMTA ALLA BILDLÄNKAR FRÅN INATURALIST
+# ============================================================
+
+def get_all_photo_urls(observation_id, fallback_image_url, session):
+    """
+    Hämtar en iNaturalist-observation via API och returnerar
+    ALLA bildlänkar som hör till observationen.
+
+    Vi använder iNaturalists API eftersom CSV-exportens
+    image_url bara innehåller en bild.
+
+    För varje foto används helst original-versionen.
+    Om original-URL saknas används foto-URL:n från API:t.
+
+    Om API-anropet misslyckas används image_url från CSV:n
+    som reserv.
+    """
+
+    observation_id = clean(observation_id)
+
+    if not observation_id:
+        return [], "Saknar iNaturalist-ID"
+
+    api_url = INAT_API_URL.format(observation_id)
+
+    try:
+
+        response = session.get(
+            api_url,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        payload = response.json()
+
+        results = payload.get("results", [])
+
+        if not results:
+            return [], "Observation hittades inte i iNaturalist API"
+
+        observation = results[0]
+
+        photos = observation.get("photos", [])
+
+        urls = []
+
+        for photo in photos:
+
+            if not isinstance(photo, dict):
+                continue
+
+            # Nya API-svar kan ha URL i "url".
+            url = photo.get("url")
+
+            if not url:
+                url = photo.get("original_url")
+
+            if not url:
+                continue
+
+            url = str(url).strip()
+
+            # Om API:t ger medium/large/etc försöker vi
+            # använda original-versionen.
+            original_url = re.sub(
+                r"/(?:square|small|medium|large|original)\.(jpg|jpeg)$",
+                lambda m: "/original." + m.group(1),
+                url,
+                flags=re.IGNORECASE
+            )
+
+            if original_url not in urls:
+                urls.append(original_url)
+
+        # Om API:t inte gav några bilder:
+        if not urls:
+
+            fallback_image_url = clean(
+                fallback_image_url
+            )
+
+            if fallback_image_url:
+                return (
+                    [fallback_image_url],
+                    "API returnerade inga bilder; "
+                    "använder image_url från CSV"
+                )
+
+            return [], "Observationen har inga bilder"
+
+        return urls, ""
+
+    except requests.RequestException as error:
+
+        fallback_image_url = clean(
+            fallback_image_url
+        )
+
+        if fallback_image_url:
+
+            return (
+                [fallback_image_url],
+                "API-fel; använder image_url från CSV: "
+                + str(error)
+            )
+
+        return [], "API-fel: " + str(error)
+
+    except Exception as error:
+
+        fallback_image_url = clean(
+            fallback_image_url
+        )
+
+        if fallback_image_url:
+
+            return (
+                [fallback_image_url],
+                "API-fel; använder image_url från CSV: "
+                + str(error)
+            )
+
+        return [], "Fel vid hämtning av bilder: " + str(error)
 
 
 # ============================================================
@@ -357,7 +499,7 @@ def read_inaturalist():
 # KONVERTERA EN OBSERVATION
 # ============================================================
 
-def convert_observation(row):
+def convert_observation(row, photo_urls):
 
     # --------------------------------------------------------
     # ART
@@ -377,7 +519,6 @@ def convert_observation(row):
             row.get("common_name")
         )
 
-
     # --------------------------------------------------------
     # DATUM / TID
     # --------------------------------------------------------
@@ -387,9 +528,8 @@ def convert_observation(row):
     )
 
     tid = parse_time(
-        row.get("time_observed_at")
+        row.get("observed_on_string")
     )
-
 
     # --------------------------------------------------------
     # LOKAL
@@ -399,7 +539,6 @@ def convert_observation(row):
         row.get("place_guess")
     )
 
-
     # --------------------------------------------------------
     # KOORDINATER
     # --------------------------------------------------------
@@ -408,7 +547,6 @@ def convert_observation(row):
         row.get("latitude"),
         row.get("longitude")
     )
-
 
     # --------------------------------------------------------
     # NOGGRANNHET
@@ -423,27 +561,31 @@ def convert_observation(row):
             row.get("positional_accuracy")
         )
 
+    # Artportalen kräver att Noggrannhet är ett POSITIVT heltal.
+    # iNaturalist kan ibland lämna public_positional_accuracy tomt
+    # även när observationen har en positional_accuracy.
     try:
-
         if noggrannhet:
-
             noggrannhet = str(
-                int(
-                    round(
-                        float(
-                            noggrannhet.replace(
-                                ",",
-                                "."
+                max(
+                    1,
+                    int(
+                        round(
+                            float(
+                                noggrannhet.replace(",", ".")
                             )
                         )
                     )
                 )
             )
+        else:
+            # Artportalen accepterar inte tomt värde här.
+            # 1 m används endast som teknisk reserv om iNaturalist
+            # saknar noggrannhetsuppgift helt.
+            noggrannhet = "1"
 
-    except ValueError:
-
-        noggrannhet = ""
-
+    except (ValueError, TypeError):
+        noggrannhet = "1"
 
     # --------------------------------------------------------
     # OBSERVATÖR
@@ -459,7 +601,6 @@ def convert_observation(row):
             row.get("user_login")
         )
 
-
     # --------------------------------------------------------
     # ÖVRIGT
     # --------------------------------------------------------
@@ -473,34 +614,43 @@ def convert_observation(row):
     )
 
     # --------------------------------------------------------
-    # FOTO
+    # ALLA FOTON
     #
-    # Endast image_url används.
+    # Ett fynd = en rad.
+    # Alla bildlänkar hamnar i Publik kommentar.
     #
-    # Publik kommentar blir:
+    # Exempel:
     #
-    # Foto: https://static.inaturalist.org/...
-    #
-    # Ingen taxon_id
-    # Ingen observations-URL
-    # Ingen beskrivning
+    # Foto 1: https://...
+    # Foto 2: https://...
+    # Foto 3: https://...
     # --------------------------------------------------------
 
-    image_url = clean(
-        row.get("image_url")
-    )
+    photo_lines = []
 
-    if image_url:
+    for index, photo_url in enumerate(
+        photo_urls,
+        start=1
+    ):
 
-        public_comment = (
-            "Foto: "
-            + image_url
+        photo_lines.append(
+            "Foto "
+            + str(index)
+            + ": "
+            + photo_url
         )
 
-    else:
+    inaturalist_url = (
+        "https://www.inaturalist.org/observations/"
+        + observation_id
+    )
 
-        public_comment = ""
+    comment_parts = photo_lines.copy()
+    comment_parts.append(
+        "iNaturalist: " + inaturalist_url
+    )
 
+    public_comment = " | ".join(comment_parts)
 
     # --------------------------------------------------------
     # DATA
@@ -524,27 +674,22 @@ def convert_observation(row):
 
         "Metod": "",
 
-
         # Lokal
-
         "Lokalnamn": lokal,
 
+        # Huvudlokal lämnas tomt.
+        "Huvudlokal": "",
 
         # SWEREF99 TM
         # Heltal
-
         "Ost": ost,
 
         "Nord": nord,
 
-
         # Noggrannhet
-
         "Noggrannhet": noggrannhet,
 
-
         # Övriga koordinatfält
-
         "Diffusion": "",
 
         "Djup min": "",
@@ -555,9 +700,7 @@ def convert_observation(row):
 
         "Höjd max": "",
 
-
         # Datum / tid
-
         "Startdatum": datum,
 
         "Starttid": tid,
@@ -566,32 +709,31 @@ def convert_observation(row):
 
         "Sluttid": tid,
 
-
         # PUBLIK KOMMENTAR
-        #
-        # Endast:
-        # Foto: + image_url
-
+        # Alla bildlänkar
         "Publik kommentar": public_comment,
-
 
         "Intressant kommentar": "",
 
-
         # Privat kommentar
-        #
-        # Licensen ligger fortfarande här,
-        # inte i publik kommentar.
+        "iNaturalist licens: "
+        "": ""
+    }
 
-        "Privat kommentar": (
-            "iNaturalist licens: "
-            + license_name
-            if license_name
-            else ""
-        ),
+    # Lägg licensen separat eftersom Python-dictionaryn
+    # annars blir svårare att läsa.
+    data["Privat kommentar"] = (
+        "iNaturalist licens: "
+        + license_name
+        if license_name
+        else ""
+    )
 
+    # --------------------------------------------------------
+    # ÖVRIGA FÄLT
+    # --------------------------------------------------------
 
-        # Övriga fält
+    data.update({
 
         "Ej återfunnen": "",
 
@@ -603,21 +745,17 @@ def convert_observation(row):
 
         "Ospontan": "",
 
-
         "Biotop": "",
 
         "Biotop-beskrivning": "",
-
 
         "Art som substrat": "",
 
         "Art som substrat beskrivning": "",
 
-
         "Substrat": "",
 
         "Substrat-beskrivning": "",
-
 
         "Offentlig samling": "",
 
@@ -625,9 +763,7 @@ def convert_observation(row):
 
         "Samlings-nummer": "",
 
-
         "Bestämningsmetod": "",
-
 
         "Artbestämd av": "",
 
@@ -635,9 +771,7 @@ def convert_observation(row):
 
         "Bestämningsår": "",
 
-
         "Beskrivning artbestämning": "",
-
 
         "Bekräftad av": "",
 
@@ -645,18 +779,20 @@ def convert_observation(row):
 
         "Bekräftelseår": "",
 
-
         "Länk till BOLD/GenBank": "",
 
-
-        # iNaturalist ID
-
-        "Externid": observation_id,
-
+        # ----------------------------------------------------
+        # EXTERNID
+        #
+        # Prefixet "iNaturalist:" läggs framför ID:t.
+        # ----------------------------------------------------
+        "Externid": (
+            "iNaturalist: "
+            + observation_id
+        ),
 
         "Ej funnen": "",
-    }
-
+    })
 
     return data, observer
 
@@ -689,7 +825,6 @@ def write_tsv(converted):
             ARTPORTAL_FIELDS
         )
 
-
         # ----------------------------------------------------
         # DATA
         # ----------------------------------------------------
@@ -707,7 +842,6 @@ def write_tsv(converted):
                 #
                 # Observatören skrivs i första.
                 # Resten lämnas tomma.
-
                 if field == "Med-observatör":
 
                     if not observer_written:
@@ -757,11 +891,27 @@ def main():
     )
 
     print(
+        " ALLA BILDLÄNKAR"
+    )
+
+    print(
         "=" * 60
     )
 
     print()
 
+    # --------------------------------------------------------
+    # HTTP SESSION
+    # --------------------------------------------------------
+
+    session = requests.Session()
+
+    session.headers.update({
+        "User-Agent": (
+            "iNaturalist-Artportalen-import/1.0 "
+            "(personal biodiversity data import)"
+        )
+    })
 
     # --------------------------------------------------------
     # LÄS FIL
@@ -794,14 +944,17 @@ def main():
 
     except Exception as error:
 
+        print()
+
         print(
             "❌ Fel vid läsning:"
         )
 
-        print(error)
+        print(
+            error
+        )
 
         return
-
 
     print()
 
@@ -810,6 +963,7 @@ def main():
         len(observations)
     )
 
+    print()
 
     # --------------------------------------------------------
     # KONVERTERA
@@ -819,16 +973,67 @@ def main():
 
     validation_warnings = []
 
+    total_photos = 0
 
-    for line_number, row in observations:
+    for index, (line_number, row) in enumerate(
+        observations,
+        start=1
+    ):
 
-        data, observer = (
-            convert_observation(row)
+        observation_id = clean(
+            row.get("id")
         )
 
+        print(
+            f"[{index}/{len(observations)}] "
+            f"Hämtar bilder för iNaturalist "
+            f"{observation_id}..."
+        )
+
+        # ----------------------------------------------------
+        # HÄMTA ALLA BILDER
+        # ----------------------------------------------------
+
+        photo_urls, photo_warning = (
+            get_all_photo_urls(
+                observation_id,
+                row.get("image_url"),
+                session
+            )
+        )
+
+        if photo_warning:
+
+            validation_warnings.append(
+                "Rad "
+                + str(line_number)
+                + ": "
+                + observation_id
+                + ": "
+                + photo_warning
+            )
+
+        print(
+            "    Antal bilder:",
+            len(photo_urls)
+        )
+
+        total_photos += len(
+            photo_urls
+        )
+
+        # ----------------------------------------------------
+        # KONVERTERA
+        # ----------------------------------------------------
+
+        data, observer = (
+            convert_observation(
+                row,
+                photo_urls
+            )
+        )
 
         missing = []
-
 
         if not data["Artnamn"]:
 
@@ -836,13 +1041,11 @@ def main():
                 "Artnamn"
             )
 
-
         if not data["Lokalnamn"]:
 
             missing.append(
                 "Lokalnamn"
             )
-
 
         if not data["Startdatum"]:
 
@@ -850,20 +1053,17 @@ def main():
                 "Startdatum"
             )
 
-
         if not data["Ost"]:
 
             missing.append(
                 "Ost"
             )
 
-
         if not data["Nord"]:
 
             missing.append(
                 "Nord"
             )
-
 
         if missing:
 
@@ -874,11 +1074,13 @@ def main():
                 + ", ".join(missing)
             )
 
-
         converted.append(
             (data, observer)
         )
 
+        time.sleep(
+            API_DELAY
+        )
 
     # --------------------------------------------------------
     # SKRIV TSV
@@ -898,10 +1100,11 @@ def main():
             "❌ Kunde inte skapa TSV:"
         )
 
-        print(error)
+        print(
+            error
+        )
 
         return
-
 
     # --------------------------------------------------------
     # SKRIV LOGG
@@ -920,14 +1123,12 @@ def main():
                 + "\n"
             )
 
-
         for warning in validation_warnings:
 
             f.write(
                 warning
                 + "\n"
             )
-
 
         if (
             not read_warnings
@@ -937,7 +1138,6 @@ def main():
             f.write(
                 "Inga varningar.\n"
             )
-
 
     # --------------------------------------------------------
     # RESULTAT
@@ -969,8 +1169,12 @@ def main():
         len(converted)
     )
 
-    print()
+    print(
+        "Antal bildlänkar:",
+        total_photos
+    )
 
+    print()
 
     # --------------------------------------------------------
     # VISA FÖRSTA OBSERVATIONEN
@@ -981,7 +1185,6 @@ def main():
         first_data, first_observer = (
             converted[0]
         )
-
 
         print(
             "Första observationen:"
@@ -1015,7 +1218,10 @@ def main():
         )
 
         print(
-            "  Foto:       ",
+            "  Foto:"
+        )
+
+        print(
             first_data["Publik kommentar"]
         )
 
@@ -1029,9 +1235,7 @@ def main():
             first_observer
         )
 
-
     print()
-
 
     # --------------------------------------------------------
     # VARNINGAR
@@ -1041,7 +1245,6 @@ def main():
         len(read_warnings)
         + len(validation_warnings)
     )
-
 
     if total_warnings:
 
@@ -1053,10 +1256,7 @@ def main():
         print()
 
         print(
-            "Se:"
-        )
-
-        print(
+            "Se:",
             ERROR_FILE
         )
 
@@ -1066,6 +1266,9 @@ def main():
             "✅ Alla obligatoriska uppgifter finns."
         )
 
+        print(
+            "✅ Alla bildlänkar hämtades utan varningar."
+        )
 
     print()
 
@@ -1075,5 +1278,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
